@@ -11,6 +11,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "10.14"
       GETTEXT_VERSION: "0.22.5"
+      PCRE2_VERSION: "10.44"
       GLIB_VERSION: "2.82.2"
 
     steps:
@@ -26,27 +27,38 @@ jobs:
       - name: Show build environment
         run: |
           set -euxo pipefail
+
           echo "Architecture:"
           uname -m
+
           echo "macOS:"
           sw_vers
+
           echo "Xcode:"
           xcodebuild -version
+
           echo "SDK:"
           xcrun --sdk macosx --show-sdk-version
+
           echo "Homebrew:"
           brew --prefix
+
           test "$(uname -m)" = "x86_64"
 
       - name: Prepare build environment
         run: |
           set -euxo pipefail
+
           echo "DEPS_PREFIX=$RUNNER_TEMP/vdagent-mojave-deps" >> "$GITHUB_ENV"
-          brew install meson ninja pkgconf pcre2
+
+          # Build tools only. Runtime/static dependencies are built from source
+          # below with an explicit macOS 10.14 deployment target.
+          brew install meson ninja pkgconf cmake
 
       - name: Build gettext for Mojave
         run: |
           set -euxo pipefail
+
           mkdir -p "$DEPS_PREFIX"
           cd "$RUNNER_TEMP"
 
@@ -75,9 +87,51 @@ jobs:
           test -f "$DEPS_PREFIX/lib/libintl.a"
           file "$DEPS_PREFIX/lib/libintl.a"
 
+      - name: Build PCRE2 for Mojave
+        run: |
+          set -euxo pipefail
+
+          cd "$RUNNER_TEMP"
+
+          git clone \
+            --depth 1 \
+            --branch "pcre2-${PCRE2_VERSION}" \
+            https://github.com/PCRE2Project/pcre2.git \
+            "pcre2-${PCRE2_VERSION}"
+
+          cd "pcre2-${PCRE2_VERSION}"
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_STATIC_LIBS=ON \
+            -DPCRE2_BUILD_PCRE2_8=ON \
+            -DPCRE2_BUILD_PCRE2_16=OFF \
+            -DPCRE2_BUILD_PCRE2_32=OFF \
+            -DPCRE2_BUILD_PCRE2GREP=OFF \
+            -DPCRE2_BUILD_TESTS=OFF
+
+          cmake --build build --parallel "$(sysctl -n hw.ncpu)"
+          cmake --install build
+
+          test -f "$DEPS_PREFIX/lib/libpcre2-8.a"
+          file "$DEPS_PREFIX/lib/libpcre2-8.a"
+
+          if find "$DEPS_PREFIX/lib" -maxdepth 1 \
+              \( -name 'libpcre2*.dylib' -o -name 'libpcre2*.so' \) \
+              -print -quit | grep -q .
+          then
+            echo "::error::PCRE2 build unexpectedly installed a shared library"
+            exit 1
+          fi
+
       - name: Build GLib for Mojave
         run: |
           set -euxo pipefail
+
           cd "$RUNNER_TEMP"
 
           curl -fL \
@@ -87,13 +141,95 @@ jobs:
           tar -xf "glib-${GLIB_VERSION}.tar.xz"
           cd "glib-${GLIB_VERSION}"
 
+          # GLib deliberately uses its select()-based poll emulation on macOS.
+          # Modern macOS SDKs implement FD_SET/FD_ISSET through
+          # __darwin_check_fd_set_overflow(), a symbol unavailable on Mojave.
+          #
+          # Replace only the six FD_SET/FD_ISSET uses in gpoll.c with the
+          # direct fd_set bit operations used by Mojave's own Darwin headers.
+          # Keep FD_ZERO and the rest of GLib unchanged.
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("glib/gpoll.c")
+          text = path.read_text()
+
+          include = """#ifdef HAVE_SYS_SELECT_H
+          #include <sys/select.h>
+          #endif /* HAVE_SYS_SELECT_H */
+          """
+
+          helper = """#ifdef HAVE_SYS_SELECT_H
+          #include <sys/select.h>
+          #endif /* HAVE_SYS_SELECT_H */
+
+          /*
+           * Compatibility helpers for binaries targeting macOS 10.14.
+           *
+           * Mojave's Darwin fd_set implementation manipulated fds_bits
+           * directly. Newer SDKs route FD_SET/FD_ISSET through
+           * __darwin_check_fd_set_overflow(), which does not exist on Mojave.
+           *
+           * These helpers preserve the Mojave fd_set bit layout and semantics
+           * while allowing the source to be compiled with a current Xcode SDK.
+           */
+          static inline void
+          glib_mojave_fd_set (int fd,
+                              fd_set *set)
+          {
+            const unsigned long nfdbits = sizeof (set->fds_bits[0]) * 8;
+
+            set->fds_bits[(unsigned long) fd / nfdbits] |=
+              (__int32_t) (((unsigned long) 1) <<
+                           ((unsigned long) fd % nfdbits));
+          }
+
+          static inline int
+          glib_mojave_fd_isset (int fd,
+                                const fd_set *set)
+          {
+            const unsigned long nfdbits = sizeof (set->fds_bits[0]) * 8;
+
+            return set->fds_bits[(unsigned long) fd / nfdbits] &
+              (__int32_t) (((unsigned long) 1) <<
+                           ((unsigned long) fd % nfdbits));
+          }
+          """
+
+          if text.count(include) != 1:
+              raise SystemExit(
+                  f"Expected exactly one sys/select.h block, found {text.count(include)}"
+              )
+
+          set_count = text.count("FD_SET (f->fd,")
+          isset_count = text.count("FD_ISSET (f->fd,")
+
+          print(f"FD_SET occurrences to patch: {set_count}")
+          print(f"FD_ISSET occurrences to patch: {isset_count}")
+
+          if set_count != 3 or isset_count != 3:
+              raise SystemExit(
+                  "Unexpected GLib gpoll.c layout; refusing to apply compatibility patch"
+              )
+
+          text = text.replace(include, helper)
+          text = text.replace("FD_SET (f->fd,", "glib_mojave_fd_set (f->fd,")
+          text = text.replace("FD_ISSET (f->fd,", "glib_mojave_fd_isset (f->fd,")
+
+          path.write_text(text)
+          PY
+
           export CC=clang
           export CXX=clang++
           export CFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
           export CXXFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
           export CPPFLAGS="-I${DEPS_PREFIX}/include"
           export LDFLAGS="-arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -L${DEPS_PREFIX}/lib"
-          export PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig:/usr/local/opt/pcre2/lib/pkgconfig"
+
+          # Put only our Mojave-targeted dependencies first. In particular,
+          # GLib must resolve PCRE2 to the static library built above rather
+          # than to a current Homebrew/system PCRE2 dylib.
+          export PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig"
 
           meson setup build \
             --prefix="$DEPS_PREFIX" \
@@ -122,6 +258,13 @@ jobs:
             file "$DEPS_PREFIX/lib/$lib"
           done
 
+          if nm -u "$DEPS_PREFIX/lib/libglib-2.0.a" \
+              | grep -q '___darwin_check_fd_set_overflow'
+          then
+            echo "::error::Mojave-incompatible fd_set overflow symbol is still present in libglib"
+            exit 1
+          fi
+
       - name: Adapt upstream Xcode project for Intel Mojave dependencies
         run: |
           set -euxo pipefail
@@ -134,6 +277,7 @@ jobs:
           path = Path("vd_agent.xcodeproj/project.pbxproj")
           text = path.read_text()
 
+          # Use headers and libraries built above for macOS 10.14.
           text = text.replace("/opt/homebrew", prefix)
 
           text = text.replace(
@@ -141,6 +285,8 @@ jobs:
               f'intel_input=\"{prefix}/lib/$name\"',
           )
 
+          # Upstream combines Intel and ARM Homebrew static libraries with lipo.
+          # This custom build intentionally produces x86_64 only.
           old = r'lipo -output \"$tmp_output\" -create \"$intel_input\" \"$arm64_input\"'
           new = r'cp \"$intel_input\" \"$tmp_output\"'
 
@@ -167,8 +313,7 @@ jobs:
             ARCHS=x86_64 \
             ONLY_ACTIVE_ARCH=NO \
             MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
-            CODE_SIGNING_ALLOWED=NO \
-            OTHER_LDFLAGS="-Wl,-ld_classic"
+            CODE_SIGNING_ALLOWED=NO
 
       - name: Verify result
         run: |
@@ -195,21 +340,31 @@ jobs:
 
             echo
             echo "Mach-O build version:"
-            xcrun vtool -show-build "$executable" || true
+            build_info="$(xcrun vtool -show-build "$executable")"
+            echo "$build_info"
+            echo "$build_info" | grep -q 'minos 10.14'
 
             echo
             echo "Dynamic dependencies:"
-            otool -L "$executable"
+            deps="$(otool -L "$executable")"
+            echo "$deps"
+
+            if echo "$deps" | tail -n +2 \
+                | grep -E '/usr/local|/opt/homebrew|libpcre2' >/dev/null
+            then
+              echo "::error::Found a non-Mojave build-time dependency in final executable"
+              exit 1
+            fi
 
             echo
             echo "fd_set overflow compatibility symbol:"
-            refs="$(nm -m "$executable" | grep '___darwin_check_fd_set_overflow' || true)"
+            refs="$(nm -m "$executable" \
+              | grep '___darwin_check_fd_set_overflow' || true)"
+
             if [ -n "$refs" ]; then
               echo "$refs"
-              if echo "$refs" | grep -vq 'weak'; then
-                echo "::error::Found a non-weak ___darwin_check_fd_set_overflow import"
-                exit 1
-              fi
+              echo "::error::Found Mojave-incompatible ___darwin_check_fd_set_overflow reference"
+              exit 1
             else
               echo "No reference found."
             fi
@@ -218,13 +373,19 @@ jobs:
       - name: Prepare result
         run: |
           set -euxo pipefail
+
           mkdir -p output
-          cp vd_agent.xcarchive/Products/usr/local/bin/spice-vdagentd output/
-          cp vd_agent.xcarchive/Products/usr/local/bin/spice-vdagent output/
+
+          cp \
+            vd_agent.xcarchive/Products/usr/local/bin/spice-vdagentd \
+            output/
+
+          cp \
+            vd_agent.xcarchive/Products/usr/local/bin/spice-vdagent \
+            output/
 
       - name: Upload x86_64 binaries
         uses: actions/upload-artifact@v4
         with:
           name: spice-vdagent-macos-x86_64-mojave
           path: output/
-
