@@ -285,6 +285,33 @@ jobs:
               f'intel_input=\"{prefix}/lib/$name\"',
           )
 
+          # Upstream explicitly links libpcre2-8.tbd from the current macOS SDK
+          # in both executable targets. Redirect that single PBX file reference
+          # to the Mojave-targeted static PCRE2 library built above. The same
+          # fileRef ID is reused by both targets, so one replacement fixes both.
+          old_pcre2 = (
+              'lastKnownFileType = "sourcecode.text-based-dylib-definition"; '
+              'name = "libpcre2-8.tbd"; '
+              'path = "usr/lib/libpcre2-8.tbd"; '
+              'sourceTree = SDKROOT;'
+          )
+          new_pcre2 = (
+              'lastKnownFileType = archive.ar; '
+              'name = "libpcre2-8.a"; '
+              f'path = "{prefix}/lib/libpcre2-8.a"; '
+              'sourceTree = "<absolute>";'
+          )
+
+          pcre2_count = text.count(old_pcre2)
+          print(f"Found {pcre2_count} SDK PCRE2 file references")
+
+          if pcre2_count != 1:
+              raise SystemExit(
+                  f"Expected exactly 1 SDK PCRE2 file reference, found {pcre2_count}"
+              )
+
+          text = text.replace(old_pcre2, new_pcre2)
+
           # Upstream combines Intel and ARM Homebrew static libraries with lipo.
           # This custom build intentionally produces x86_64 only.
           old = r'lipo -output \"$tmp_output\" -create \"$intel_input\" \"$arm64_input\"'
