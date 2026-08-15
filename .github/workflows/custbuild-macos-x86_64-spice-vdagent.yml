@@ -1,0 +1,129 @@
+name: Build spice-vdagent for MAc OS X platform  x86_64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build macOS x86_64
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout upstream vd_agent
+        uses: actions/checkout@v4
+        with:
+          repository: utmapp/vd_agent
+          ref: main
+          submodules: recursive
+
+      - name: Show build environment
+        run: |
+          echo "Architecture:"
+          uname -m
+
+          echo "macOS:"
+          sw_vers
+
+          echo "Xcode:"
+          xcodebuild -version
+
+          echo "Homebrew:"
+          brew --prefix
+
+      - name: Install GLib
+        run: |
+          brew install glib
+
+          echo "Checking required Intel libraries..."
+
+          for lib in \
+            libgio-2.0.a \
+            libglib-2.0.a \
+            libgobject-2.0.a \
+            libgmodule-2.0.a \
+            libintl.a
+          do
+            if [ ! -f "/usr/local/lib/$lib" ]; then
+              echo "Missing /usr/local/lib/$lib"
+              exit 1
+            fi
+          done
+
+      - name: Adapt upstream project for Intel-only build
+        run: |
+          # Upstream header search paths point to /opt/homebrew.
+          # On an Intel Homebrew installation the same headers live in /usr/local.
+          sudo mkdir -p /opt
+
+          if [ ! -e /opt/homebrew ]; then
+            sudo ln -s /usr/local /opt/homebrew
+          fi
+
+          # Upstream combines Intel + ARM Homebrew static libraries with lipo.
+          # For this build we want only Intel x86_64, so copy the Intel library.
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("vd_agent.xcodeproj/project.pbxproj")
+          text = path.read_text()
+
+          old = r'lipo -output \"$tmp_output\" -create \"$intel_input\" \"$arm64_input\"'
+          new = r'cp \"$intel_input\" \"$tmp_output\"'
+
+          count = text.count(old)
+          print(f"Found {count} universal-GLib build commands")
+
+          if count != 2:
+              raise SystemExit(
+                  f"Expected exactly 2 lipo commands, found {count}"
+              )
+
+          path.write_text(text.replace(old, new))
+          PY
+
+      - name: Build x86_64 archive
+        run: |
+          xcodebuild archive \
+            -scheme vd_agent \
+            -configuration Release \
+            -archivePath "$PWD/vd_agent.xcarchive" \
+            ARCHS=x86_64 \
+            ONLY_ACTIVE_ARCH=NO \
+            MACOSX_DEPLOYMENT_TARGET=10.14
+
+      - name: Verify result
+        run: |
+          DAEMON="$PWD/vd_agent.xcarchive/Products/usr/local/bin/spice-vdagentd"
+          AGENT="$PWD/vd_agent.xcarchive/Products/usr/local/bin/spice-vdagent"
+
+          test -f "$DAEMON"
+          test -f "$AGENT"
+
+          echo "spice-vdagentd:"
+          file "$DAEMON"
+          lipo -archs "$DAEMON"
+
+          echo "spice-vdagent:"
+          file "$AGENT"
+          lipo -archs "$AGENT"
+
+          test "$(lipo -archs "$DAEMON")" = "x86_64"
+          test "$(lipo -archs "$AGENT")" = "x86_64"
+
+      - name: Prepare result
+        run: |
+          mkdir output
+
+          cp \
+            vd_agent.xcarchive/Products/usr/local/bin/spice-vdagentd \
+            output/
+
+          cp \
+            vd_agent.xcarchive/Products/usr/local/bin/spice-vdagent \
+            output/
+
+      - name: Upload x86_64 binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: spice-vdagent-macos-x86_64
+          path: output/
