@@ -1,129 +1,228 @@
-name: Build spice-vdagent for MAc OS X platform  x86_64
+name: Build spice-vdagent for Mac OS X 10.14 platform  x86_64
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build macOS x86_64
+    name: Build macOS x86_64 / Mojave-compatible
     runs-on: macos-15-intel
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.14"
+      GETTEXT_VERSION: "0.22.5"
+      GLIB_VERSION: "2.82.2"
 
     steps:
       - name: Checkout upstream vd_agent
         uses: actions/checkout@v4
         with:
           repository: utmapp/vd_agent
-          ref: main
+          ref: v0.22.1
           submodules: recursive
 
       - name: Show build environment
         run: |
+          set -euxo pipefail
           echo "Architecture:"
           uname -m
-
           echo "macOS:"
           sw_vers
-
           echo "Xcode:"
           xcodebuild -version
-
+          echo "SDK:"
+          xcrun --sdk macosx --show-sdk-version
           echo "Homebrew:"
           brew --prefix
+          test "$(uname -m)" = "x86_64"
 
-      - name: Install GLib
+      - name: Prepare build environment
         run: |
-          brew install glib
+          set -euxo pipefail
+          echo "DEPS_PREFIX=$RUNNER_TEMP/vdagent-mojave-deps" >> "$GITHUB_ENV"
+          brew install meson ninja pkgconf pcre2
 
-          echo "Checking required Intel libraries..."
+      - name: Build gettext for Mojave
+        run: |
+          set -euxo pipefail
+          mkdir -p "$DEPS_PREFIX"
+          cd "$RUNNER_TEMP"
+
+          curl -fL \
+            "https://ftp.gnu.org/gnu/gettext/gettext-${GETTEXT_VERSION}.tar.xz" \
+            -o "gettext-${GETTEXT_VERSION}.tar.xz"
+
+          tar -xf "gettext-${GETTEXT_VERSION}.tar.xz"
+          cd "gettext-${GETTEXT_VERSION}"
+
+          export CC=clang
+          export CXX=clang++
+          export CFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CXXFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CPPFLAGS="-I${DEPS_PREFIX}/include"
+          export LDFLAGS="-arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -L${DEPS_PREFIX}/lib"
+
+          ./configure \
+            --prefix="$DEPS_PREFIX" \
+            --disable-shared \
+            --enable-static
+
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+          test -f "$DEPS_PREFIX/lib/libintl.a"
+          file "$DEPS_PREFIX/lib/libintl.a"
+
+      - name: Build GLib for Mojave
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+
+          curl -fL \
+            "https://download.gnome.org/sources/glib/2.82/glib-${GLIB_VERSION}.tar.xz" \
+            -o "glib-${GLIB_VERSION}.tar.xz"
+
+          tar -xf "glib-${GLIB_VERSION}.tar.xz"
+          cd "glib-${GLIB_VERSION}"
+
+          export CC=clang
+          export CXX=clang++
+          export CFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CXXFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CPPFLAGS="-I${DEPS_PREFIX}/include"
+          export LDFLAGS="-arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -L${DEPS_PREFIX}/lib"
+          export PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig:/usr/local/opt/pcre2/lib/pkgconfig"
+
+          meson setup build \
+            --prefix="$DEPS_PREFIX" \
+            --default-library=static \
+            -Dtests=false \
+            -Dinstalled_tests=false \
+            -Dintrospection=disabled \
+            -Ddtrace=disabled \
+            -Dsystemtap=disabled \
+            -Dsysprof=disabled \
+            -Ddocumentation=false \
+            -Dman-pages=disabled \
+            -Dlibmount=disabled \
+            -Dselinux=disabled
+
+          meson compile -C build
+          meson install -C build
 
           for lib in \
             libgio-2.0.a \
             libglib-2.0.a \
             libgobject-2.0.a \
-            libgmodule-2.0.a \
-            libintl.a
+            libgmodule-2.0.a
           do
-            if [ ! -f "/usr/local/lib/$lib" ]; then
-              echo "Missing /usr/local/lib/$lib"
-              exit 1
-            fi
+            test -f "$DEPS_PREFIX/lib/$lib"
+            file "$DEPS_PREFIX/lib/$lib"
           done
 
-      - name: Adapt upstream project for Intel-only build
+      - name: Adapt upstream Xcode project for Intel Mojave dependencies
         run: |
-          # Upstream header search paths point to /opt/homebrew.
-          # On an Intel Homebrew installation the same headers live in /usr/local.
-          sudo mkdir -p /opt
+          set -euxo pipefail
 
-          if [ ! -e /opt/homebrew ]; then
-            sudo ln -s /usr/local /opt/homebrew
-          fi
-
-          # Upstream combines Intel + ARM Homebrew static libraries with lipo.
-          # For this build we want only Intel x86_64, so copy the Intel library.
           python3 <<'PY'
+          import os
           from pathlib import Path
 
+          prefix = os.environ["DEPS_PREFIX"]
           path = Path("vd_agent.xcodeproj/project.pbxproj")
           text = path.read_text()
+
+          text = text.replace("/opt/homebrew", prefix)
+
+          text = text.replace(
+              'intel_input=\"/usr/local/lib/$name\"',
+              f'intel_input=\"{prefix}/lib/$name\"',
+          )
 
           old = r'lipo -output \"$tmp_output\" -create \"$intel_input\" \"$arm64_input\"'
           new = r'cp \"$intel_input\" \"$tmp_output\"'
 
           count = text.count(old)
-          print(f"Found {count} universal-GLib build commands")
+          print(f"Found {count} universal-library lipo commands")
 
           if count != 2:
               raise SystemExit(
-                  f"Expected exactly 2 lipo commands, found {count}"
+                  f"Expected exactly 2 lipo commands in upstream Xcode project, found {count}"
               )
 
-          path.write_text(text.replace(old, new))
+          text = text.replace(old, new)
+          path.write_text(text)
           PY
 
       - name: Build x86_64 archive
         run: |
+          set -euxo pipefail
+
           xcodebuild archive \
             -scheme vd_agent \
             -configuration Release \
             -archivePath "$PWD/vd_agent.xcarchive" \
             ARCHS=x86_64 \
             ONLY_ACTIVE_ARCH=NO \
-            MACOSX_DEPLOYMENT_TARGET=10.14
+            MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            CODE_SIGNING_ALLOWED=NO \
+            OTHER_LDFLAGS="-Wl,-ld_classic"
 
       - name: Verify result
         run: |
+          set -euxo pipefail
+
           DAEMON="$PWD/vd_agent.xcarchive/Products/usr/local/bin/spice-vdagentd"
           AGENT="$PWD/vd_agent.xcarchive/Products/usr/local/bin/spice-vdagent"
 
           test -f "$DAEMON"
           test -f "$AGENT"
 
-          echo "spice-vdagentd:"
-          file "$DAEMON"
-          lipo -archs "$DAEMON"
+          for executable in "$DAEMON" "$AGENT"
+          do
+            echo
+            echo "============================================================"
+            echo "$executable"
+            echo "============================================================"
 
-          echo "spice-vdagent:"
-          file "$AGENT"
-          lipo -archs "$AGENT"
+            file "$executable"
 
-          test "$(lipo -archs "$DAEMON")" = "x86_64"
-          test "$(lipo -archs "$AGENT")" = "x86_64"
+            archs="$(lipo -archs "$executable")"
+            echo "Architectures: $archs"
+            test "$archs" = "x86_64"
+
+            echo
+            echo "Mach-O build version:"
+            xcrun vtool -show-build "$executable" || true
+
+            echo
+            echo "Dynamic dependencies:"
+            otool -L "$executable"
+
+            echo
+            echo "fd_set overflow compatibility symbol:"
+            refs="$(nm -m "$executable" | grep '___darwin_check_fd_set_overflow' || true)"
+            if [ -n "$refs" ]; then
+              echo "$refs"
+              if echo "$refs" | grep -vq 'weak'; then
+                echo "::error::Found a non-weak ___darwin_check_fd_set_overflow import"
+                exit 1
+              fi
+            else
+              echo "No reference found."
+            fi
+          done
 
       - name: Prepare result
         run: |
-          mkdir output
-
-          cp \
-            vd_agent.xcarchive/Products/usr/local/bin/spice-vdagentd \
-            output/
-
-          cp \
-            vd_agent.xcarchive/Products/usr/local/bin/spice-vdagent \
-            output/
+          set -euxo pipefail
+          mkdir -p output
+          cp vd_agent.xcarchive/Products/usr/local/bin/spice-vdagentd output/
+          cp vd_agent.xcarchive/Products/usr/local/bin/spice-vdagent output/
 
       - name: Upload x86_64 binaries
         uses: actions/upload-artifact@v4
         with:
-          name: spice-vdagent-macos-x86_64
+          name: spice-vdagent-macos-x86_64-mojave
           path: output/
+
