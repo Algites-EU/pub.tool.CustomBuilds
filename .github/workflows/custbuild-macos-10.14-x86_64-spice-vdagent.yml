@@ -18,7 +18,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: utmapp/vd_agent
-          ref: v0.22.1
+          # Immutable commit corresponding to upstream release:
+          # spice-vdagent-0.22.1-macOS
+          ref: 5ccfc993f40ab7f0bd6dfd458e41e0b6f4f8c070
           submodules: recursive
 
       - name: Show build environment
