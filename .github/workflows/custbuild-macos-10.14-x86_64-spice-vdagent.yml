@@ -55,6 +55,65 @@ jobs:
           # below with an explicit macOS 10.14 deployment target.
           brew install meson ninja pkgconf cmake
 
+          MOJAVE_FDSET_HEADER="$RUNNER_TEMP/algites-mojave-fdset-compat.h"
+          echo "MOJAVE_FDSET_HEADER=$MOJAVE_FDSET_HEADER" >> "$GITHUB_ENV"
+
+          cat > "$MOJAVE_FDSET_HEADER" <<'EOF'
+          #ifndef ALGITES_MOJAVE_FDSET_COMPAT_H
+          #define ALGITES_MOJAVE_FDSET_COMPAT_H
+
+          /*
+           * Build compatibility for macOS 10.14 Mojave while compiling with
+           * a modern macOS SDK.
+           *
+           * Modern Darwin headers implement FD_SET/FD_CLR/FD_ISSET through
+           * __darwin_check_fd_set_overflow(), which is not present on Mojave.
+           * Mojave itself manipulated fd_set.fds_bits directly.
+           *
+           * Force the Mojave-compatible operations for every C/C++ translation
+           * unit in this custom build, not just GLib's gpoll.c.
+           */
+          #include <sys/select.h>
+
+          #if defined(__APPLE__)
+          #undef FD_SET
+          #undef FD_CLR
+          #undef FD_ISSET
+
+          static __inline void
+          algites_mojave_fd_set(int fd, fd_set *set)
+          {
+              const unsigned long nfdbits = sizeof(set->fds_bits[0]) * 8UL;
+              set->fds_bits[(unsigned long)fd / nfdbits] |=
+                  (__int32_t)(((unsigned long)1) << ((unsigned long)fd % nfdbits));
+          }
+
+          static __inline void
+          algites_mojave_fd_clr(int fd, fd_set *set)
+          {
+              const unsigned long nfdbits = sizeof(set->fds_bits[0]) * 8UL;
+              set->fds_bits[(unsigned long)fd / nfdbits] &=
+                  ~(__int32_t)(((unsigned long)1) << ((unsigned long)fd % nfdbits));
+          }
+
+          static __inline int
+          algites_mojave_fd_isset(int fd, const fd_set *set)
+          {
+              const unsigned long nfdbits = sizeof(set->fds_bits[0]) * 8UL;
+              return set->fds_bits[(unsigned long)fd / nfdbits] &
+                  (__int32_t)(((unsigned long)1) << ((unsigned long)fd % nfdbits));
+          }
+
+          #define FD_SET(fd, set)   algites_mojave_fd_set((fd), (set))
+          #define FD_CLR(fd, set)   algites_mojave_fd_clr((fd), (set))
+          #define FD_ISSET(fd, set) algites_mojave_fd_isset((fd), (set))
+          #endif
+
+          #endif
+          EOF
+
+          cat "$MOJAVE_FDSET_HEADER"
+
       - name: Build gettext for Mojave
         run: |
           set -euxo pipefail
@@ -71,8 +130,8 @@ jobs:
 
           export CC=clang
           export CXX=clang++
-          export CFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
-          export CXXFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -include ${MOJAVE_FDSET_HEADER}"
+          export CXXFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -include ${MOJAVE_FDSET_HEADER}"
           export CPPFLAGS="-I${DEPS_PREFIX}/include"
           export LDFLAGS="-arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -L${DEPS_PREFIX}/lib"
 
@@ -106,6 +165,8 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DCMAKE_C_FLAGS="-include $MOJAVE_FDSET_HEADER" \
+            -DCMAKE_CXX_FLAGS="-include $MOJAVE_FDSET_HEADER" \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUILD_STATIC_LIBS=ON \
             -DPCRE2_BUILD_PCRE2_8=ON \
@@ -141,88 +202,13 @@ jobs:
           tar -xf "glib-${GLIB_VERSION}.tar.xz"
           cd "glib-${GLIB_VERSION}"
 
-          # GLib deliberately uses its select()-based poll emulation on macOS.
-          # Modern macOS SDKs implement FD_SET/FD_ISSET through
-          # __darwin_check_fd_set_overflow(), a symbol unavailable on Mojave.
-          #
-          # Replace only the six FD_SET/FD_ISSET uses in gpoll.c with the
-          # direct fd_set bit operations used by Mojave's own Darwin headers.
-          # Keep FD_ZERO and the rest of GLib unchanged.
-          python3 <<'PY'
-          from pathlib import Path
-
-          path = Path("glib/gpoll.c")
-          text = path.read_text()
-
-          include = """#ifdef HAVE_SYS_SELECT_H
-          #include <sys/select.h>
-          #endif /* HAVE_SYS_SELECT_H */
-          """
-
-          helper = """#ifdef HAVE_SYS_SELECT_H
-          #include <sys/select.h>
-          #endif /* HAVE_SYS_SELECT_H */
-
-          /*
-           * Compatibility helpers for binaries targeting macOS 10.14.
-           *
-           * Mojave's Darwin fd_set implementation manipulated fds_bits
-           * directly. Newer SDKs route FD_SET/FD_ISSET through
-           * __darwin_check_fd_set_overflow(), which does not exist on Mojave.
-           *
-           * These helpers preserve the Mojave fd_set bit layout and semantics
-           * while allowing the source to be compiled with a current Xcode SDK.
-           */
-          static inline void
-          glib_mojave_fd_set (int fd,
-                              fd_set *set)
-          {
-            const unsigned long nfdbits = sizeof (set->fds_bits[0]) * 8;
-
-            set->fds_bits[(unsigned long) fd / nfdbits] |=
-              (__int32_t) (((unsigned long) 1) <<
-                           ((unsigned long) fd % nfdbits));
-          }
-
-          static inline int
-          glib_mojave_fd_isset (int fd,
-                                const fd_set *set)
-          {
-            const unsigned long nfdbits = sizeof (set->fds_bits[0]) * 8;
-
-            return set->fds_bits[(unsigned long) fd / nfdbits] &
-              (__int32_t) (((unsigned long) 1) <<
-                           ((unsigned long) fd % nfdbits));
-          }
-          """
-
-          if text.count(include) != 1:
-              raise SystemExit(
-                  f"Expected exactly one sys/select.h block, found {text.count(include)}"
-              )
-
-          set_count = text.count("FD_SET (f->fd,")
-          isset_count = text.count("FD_ISSET (f->fd,")
-
-          print(f"FD_SET occurrences to patch: {set_count}")
-          print(f"FD_ISSET occurrences to patch: {isset_count}")
-
-          if set_count != 3 or isset_count != 3:
-              raise SystemExit(
-                  "Unexpected GLib gpoll.c layout; refusing to apply compatibility patch"
-              )
-
-          text = text.replace(include, helper)
-          text = text.replace("FD_SET (f->fd,", "glib_mojave_fd_set (f->fd,")
-          text = text.replace("FD_ISSET (f->fd,", "glib_mojave_fd_isset (f->fd,")
-
-          path.write_text(text)
-          PY
-
+          # Compile all GLib/GIO sources with the Mojave fd_set compatibility
+          # header created above. This avoids relying on a source-file-specific
+          # patch and covers any FD_SET/FD_ISSET use in all static GLib libraries.
           export CC=clang
           export CXX=clang++
-          export CFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
-          export CXXFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -include ${MOJAVE_FDSET_HEADER}"
+          export CXXFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -include ${MOJAVE_FDSET_HEADER}"
           export CPPFLAGS="-I${DEPS_PREFIX}/include"
           export LDFLAGS="-arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -L${DEPS_PREFIX}/lib"
 
@@ -258,12 +244,35 @@ jobs:
             file "$DEPS_PREFIX/lib/$lib"
           done
 
-          if nm -u "$DEPS_PREFIX/lib/libglib-2.0.a" \
-              | grep -q '___darwin_check_fd_set_overflow'
-          then
-            echo "::error::Mojave-incompatible fd_set overflow symbol is still present in libglib"
-            exit 1
-          fi
+      - name: Verify static dependencies for Mojave
+        run: |
+          set -euxo pipefail
+
+          for lib in \
+            libintl.a \
+            libpcre2-8.a \
+            libgio-2.0.a \
+            libglib-2.0.a \
+            libgobject-2.0.a \
+            libgmodule-2.0.a
+          do
+            path="$DEPS_PREFIX/lib/$lib"
+            test -f "$path"
+
+            echo
+            echo "Checking $path"
+
+            refs="$(nm -u "$path" \
+              | grep '___darwin_check_fd_set_overflow' || true)"
+
+            if [ -n "$refs" ]; then
+              echo "$refs"
+              echo "::error::Mojave-incompatible fd_set overflow symbol is present in $lib"
+              exit 1
+            fi
+          done
+
+          echo "All custom static dependencies are free of the Mojave-incompatible fd_set symbol."
 
       - name: Adapt upstream Xcode project for Intel Mojave dependencies
         run: |
@@ -370,6 +379,8 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
             CODE_SIGNING_ALLOWED=NO \
+            OTHER_CFLAGS="-include $MOJAVE_FDSET_HEADER" \
+            OTHER_CPLUSPLUSFLAGS="-include $MOJAVE_FDSET_HEADER" \
             OTHER_LDFLAGS="-Wl,-force_load,$PCRE2_STATIC"
 
       - name: Verify result
