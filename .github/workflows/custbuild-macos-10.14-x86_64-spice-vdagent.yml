@@ -526,18 +526,27 @@ jobs:
 
             if [ -n "$refs" ]; then
               echo "$refs"
+
+              if echo "$refs" | grep -q '(undefined)'
+              then
+                echo "::error::Found an undefined Mojave-incompatible ___darwin_check_fd_set_overflow import"
+                exit 1
+              fi
+
+              echo "The fd_set compatibility symbol is resolved locally."
             else
-              echo "::error::Mojave fd_set compatibility symbol is missing from final executable"
-              exit 1
+              echo "No fd_set overflow compatibility symbol is referenced."
             fi
 
-            if echo "$refs" | grep -q '(undefined)'
+            # The only unsafe state for Mojave is an unresolved dynamic import.
+            # A completely absent symbol is ideal; a locally resolved shim is
+            # also valid.
+            if nm -u "$executable" \
+                | grep -q '___darwin_check_fd_set_overflow'
             then
-              echo "::error::Found an undefined Mojave-incompatible ___darwin_check_fd_set_overflow import"
+              echo "::error::Final executable still imports ___darwin_check_fd_set_overflow"
               exit 1
             fi
-
-            echo "The fd_set compatibility shim is defined locally in the executable."
           done
 
       - name: Prepare result
@@ -559,3 +568,4 @@ jobs:
         with:
           name: spice-vdagent-macos-x86_64-mojave
           path: output/
+     
