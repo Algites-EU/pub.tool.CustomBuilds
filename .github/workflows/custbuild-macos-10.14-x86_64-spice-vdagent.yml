@@ -364,6 +364,93 @@ jobs:
 
           echo "No SDK PCRE2 reference remains in project.pbxproj."
 
+      - name: Build macOS fd_set runtime compatibility shim
+        run: |
+          set -euxo pipefail
+
+          SHIM_SOURCE="$RUNNER_TEMP/algites-macos-fdset-shim.c"
+          SHIM_OBJECT="$RUNNER_TEMP/algites-macos-fdset-shim.o"
+
+          cat > "$SHIM_SOURCE" <<'EOF'
+          /*
+           * Compatibility shim for binaries built with modern Apple SDKs but
+           * targeting macOS 10.14 Mojave and later.
+           *
+           * Modern Darwin FD_SET/FD_CLR/FD_ISSET helpers call
+           * __darwin_check_fd_set_overflow(), which is unavailable on Mojave.
+           *
+           * On macOS 11 and later, delegate to Apple's real implementation
+           * through RTLD_NEXT. On Mojave, where that symbol is absent, return
+           * 1 to reproduce the pre-macOS-11 fd_set behaviour.
+           */
+          #include <dlfcn.h>
+          #include <pthread.h>
+          #include <stddef.h>
+
+          typedef int (*darwin_fd_set_overflow_fn)(
+              int fd,
+              const void *fdset,
+              int unlimited);
+
+          static darwin_fd_set_overflow_fn real_darwin_fd_set_overflow = NULL;
+          static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
+
+          static void
+          resolve_darwin_fd_set_overflow(void)
+          {
+              real_darwin_fd_set_overflow =
+                  (darwin_fd_set_overflow_fn)
+                  dlsym(RTLD_NEXT, "__darwin_check_fd_set_overflow");
+          }
+
+          int
+          __darwin_check_fd_set_overflow(
+              int fd,
+              const void *fdset,
+              int unlimited)
+          {
+              (void)pthread_once(
+                  &resolve_once,
+                  resolve_darwin_fd_set_overflow);
+
+              if (real_darwin_fd_set_overflow != NULL) {
+                  return real_darwin_fd_set_overflow(
+                      fd,
+                      fdset,
+                      unlimited);
+              }
+
+              /* macOS 10.14 Mojave fallback. */
+              (void)fd;
+              (void)fdset;
+              (void)unlimited;
+              return 1;
+          }
+          EOF
+
+          clang \
+            -c \
+            -O2 \
+            -arch x86_64 \
+            -mmacosx-version-min="$MACOSX_DEPLOYMENT_TARGET" \
+            "$SHIM_SOURCE" \
+            -o "$SHIM_OBJECT"
+
+          file "$SHIM_OBJECT"
+
+          shim_symbol="$(nm -m "$SHIM_OBJECT" \
+            | grep '___darwin_check_fd_set_overflow' || true)"
+
+          echo "$shim_symbol"
+
+          if [ -z "$shim_symbol" ] || echo "$shim_symbol" | grep -q '(undefined)'
+          then
+            echo "::error::macOS fd_set compatibility shim does not define the required symbol"
+            exit 1
+          fi
+
+          echo "MOJAVE_FDSET_SHIM_OBJECT=$SHIM_OBJECT" >> "$GITHUB_ENV"
+
       - name: Build x86_64 archive
         run: |
           set -euxo pipefail
@@ -371,11 +458,16 @@ jobs:
           PCRE2_STATIC="$DEPS_PREFIX/lib/libpcre2-8.a"
 
           test -f "$PCRE2_STATIC"
+          test -f "$MOJAVE_FDSET_SHIM_OBJECT"
 
           # The SDK PCRE2 was removed from both Frameworks phases above.
           # Force-load our macOS-10.14-targeted archive explicitly so that
           # unresolved PCRE2 symbols from static GLib are resolved regardless
           # of archive ordering in Xcode's generated linker command.
+          #
+          # Link the fd_set compatibility shim directly into both
+          # executables. On Mojave it supplies the missing symbol; on macOS 11+
+          # it delegates to Apple's implementation through RTLD_NEXT.
           xcodebuild archive \
             -scheme vd_agent \
             -configuration Release \
@@ -384,9 +476,7 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
             CODE_SIGNING_ALLOWED=NO \
-            OTHER_CFLAGS="-include $MOJAVE_FDSET_HEADER" \
-            OTHER_CPLUSPLUSFLAGS="-include $MOJAVE_FDSET_HEADER" \
-            OTHER_LDFLAGS="-Wl,-force_load,$PCRE2_STATIC"
+            OTHER_LDFLAGS="$MOJAVE_FDSET_SHIM_OBJECT -Wl,-force_load,$PCRE2_STATIC"
 
       - name: Verify result
         run: |
@@ -436,11 +526,18 @@ jobs:
 
             if [ -n "$refs" ]; then
               echo "$refs"
-              echo "::error::Found Mojave-incompatible ___darwin_check_fd_set_overflow reference"
-              exit 1
             else
-              echo "No reference found."
+              echo "::error::Mojave fd_set compatibility symbol is missing from final executable"
+              exit 1
             fi
+
+            if echo "$refs" | grep -q '(undefined)'
+            then
+              echo "::error::Found an undefined Mojave-incompatible ___darwin_check_fd_set_overflow import"
+              exit 1
+            fi
+
+            echo "The fd_set compatibility shim is defined locally in the executable."
           done
 
       - name: Prepare result
